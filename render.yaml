@@ -1,0 +1,22 @@
+# render.yaml - Configuration de déploiement pour Render.com
+
+services:
+  - type: web
+    name: e-coris-api
+    env: node
+    region: frankfurt # ou paris pour moins de latence en Afrique
+    plan: free # ou starter pour plus de performance
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: FRONTEND_URL
+        sync: false # À configurer manuellement après déploiement frontend
+      - key: JWT_SECRET
+        generateValue: true
+      - key: FIREBASE_SERVICE_ACCOUNT
+        sync: false # À configurer manuellement avec le JSON Firebase
