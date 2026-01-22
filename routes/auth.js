@@ -210,4 +210,48 @@ router.get('/me', require('../middleware/auth'), async (req, res) => {
   }
 });
 
+// Activer un code de formation
+router.post('/activate', require('../middleware/auth'), async (req, res) => {
+  try {
+    const { code } = req.body;
+
+    if (!code) {
+      return res.status(400).json({ error: 'Code d\'activation requis' });
+    }
+
+    const db = admin.firestore();
+
+    // Vérifier le code d'achat
+    const purchaseRef = await db.collection('purchases')
+      .where('code', '==', code.trim().toUpperCase())
+      .where('used', '==', false)
+      .get();
+
+    if (purchaseRef.empty) {
+      return res.status(400).json({ error: 'Code invalide ou déjà utilisé' });
+    }
+
+    // Marquer le code comme utilisé
+    await purchaseRef.docs[0].ref.update({ 
+      used: true, 
+      usedAt: admin.firestore.FieldValue.serverTimestamp(),
+      usedBy: req.user.userId
+    });
+
+    // Activer la formation pour l'utilisateur
+    await db.collection('users').doc(req.user.userId).update({
+      hasFormationAccess: true,
+      formationActivatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({ 
+      success: true,
+      message: 'Formation activée avec succès' 
+    });
+  } catch (error) {
+    console.error('Erreur activation:', error);
+    res.status(500).json({ error: 'Erreur lors de l\'activation' });
+  }
+});
+
 module.exports = router;
