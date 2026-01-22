@@ -22,6 +22,8 @@ const app = express();
 
 // Middlewares de sécurité
 app.use(helmet());
+
+// Configuration CORS - enlever le slash final si présent
 const frontendUrl = (process.env.FRONTEND_URL || '').replace(/\/$/, '');
 app.use(cors({
   origin: frontendUrl || '*',
@@ -30,6 +32,9 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 app.use(express.json());
+
+// Trust proxy pour Render/Vercel (nécessaire pour rate limiting)
+app.set('trust proxy', 1);
 
 // Rate limiting
 const limiter = rateLimit({

@@ -8,35 +8,45 @@ router.get('/', async (req, res) => {
     const db = admin.firestore();
     const { type, category, startDate, endDate, limit = 50 } = req.query;
 
-    let query = db.collection('transactions')
+    // Requête simple sans orderBy pour éviter les index composites
+    const snapshot = await db.collection('transactions')
       .where('userId', '==', req.user.userId)
-      .orderBy('date', 'desc');
-
-    if (type) {
-      query = query.where('type', '==', type);
-    }
-
-    if (category) {
-      query = query.where('category', '==', category);
-    }
-
-    const snapshot = await query.limit(parseInt(limit)).get();
+      .get();
 
     let transactions = [];
     snapshot.forEach(doc => {
       const data = doc.data();
-      // Filtrer par date côté serveur si nécessaire
-      if (startDate || endDate) {
-        const transDate = data.date.toDate();
-        if (startDate && transDate < new Date(startDate)) return;
-        if (endDate && transDate > new Date(endDate)) return;
+      
+      // Filtrer côté serveur
+      if (type && type !== 'all' && data.type !== type) return;
+      if (category && category !== 'all' && data.category !== category) return;
+      
+      // Convertir la date
+      let transDate;
+      if (data.date && data.date.toDate) {
+        transDate = data.date.toDate();
+      } else if (data.date) {
+        transDate = new Date(data.date);
+      } else {
+        transDate = new Date();
       }
+      
+      // Filtrer par date si nécessaire
+      if (startDate && startDate !== 'null' && transDate < new Date(startDate)) return;
+      if (endDate && endDate !== 'null' && transDate > new Date(endDate)) return;
+      
       transactions.push({
         id: doc.id,
         ...data,
-        date: data.date.toDate().toISOString()
+        date: transDate.toISOString()
       });
     });
+
+    // Trier par date décroissante côté serveur
+    transactions.sort((a, b) => new Date(b.date) - new Date(a.date));
+    
+    // Limiter le nombre de résultats
+    transactions = transactions.slice(0, parseInt(limit));
 
     res.json({ transactions });
   } catch (error) {
@@ -76,12 +86,19 @@ router.post('/', async (req, res) => {
     const newTransaction = await transactionRef.get();
     const data = newTransaction.data();
 
+    let transDate;
+    if (data.date && data.date.toDate) {
+      transDate = data.date.toDate();
+    } else {
+      transDate = new Date();
+    }
+
     res.status(201).json({
       message: 'Transaction créée avec succès',
       transaction: {
         id: transactionRef.id,
         ...data,
-        date: data.date.toDate().toISOString()
+        date: transDate.toISOString()
       }
     });
   } catch (error) {
@@ -123,12 +140,19 @@ router.put('/:id', async (req, res) => {
     const updated = await transactionRef.get();
     const data = updated.data();
 
+    let transDate;
+    if (data.date && data.date.toDate) {
+      transDate = data.date.toDate();
+    } else {
+      transDate = new Date();
+    }
+
     res.json({
       message: 'Transaction modifiée avec succès',
       transaction: {
         id,
         ...data,
-        date: data.date.toDate().toISOString()
+        date: transDate.toISOString()
       }
     });
   } catch (error) {

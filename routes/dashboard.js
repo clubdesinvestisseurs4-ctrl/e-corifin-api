@@ -2,6 +2,32 @@ const express = require('express');
 const router = express.Router();
 const admin = require('firebase-admin');
 
+// Helper: Convertir date Firestore en Date JS
+function toJsDate(firestoreDate) {
+  if (!firestoreDate) return new Date();
+  if (firestoreDate.toDate) return firestoreDate.toDate();
+  return new Date(firestoreDate);
+}
+
+// Helper: Récupérer toutes les transactions d'un utilisateur
+async function getUserTransactions(db, userId) {
+  const snapshot = await db.collection('transactions')
+    .where('userId', '==', userId)
+    .get();
+  
+  const transactions = [];
+  snapshot.forEach(doc => {
+    const data = doc.data();
+    transactions.push({
+      id: doc.id,
+      ...data,
+      date: toJsDate(data.date)
+    });
+  });
+  
+  return transactions;
+}
+
 // Récupérer le résumé financier
 router.get('/summary', async (req, res) => {
   try {
@@ -20,19 +46,22 @@ router.get('/summary', async (req, res) => {
       endDate = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59);
     }
 
-    const transactionsSnapshot = await db.collection('transactions')
-      .where('userId', '==', req.user.userId)
-      .where('date', '>=', admin.firestore.Timestamp.fromDate(startDate))
-      .where('date', '<=', admin.firestore.Timestamp.fromDate(endDate))
-      .get();
-
+    // Récupérer toutes les transactions et filtrer côté serveur
+    const allTransactions = await getUserTransactions(db, req.user.userId);
+    
     let totalIncome = 0;
     let totalExpense = 0;
     const expensesByCategory = {};
     const incomesByCategory = {};
+    let transactionCount = 0;
 
-    transactionsSnapshot.forEach(doc => {
-      const { type, amount, category } = doc.data();
+    allTransactions.forEach(trans => {
+      // Filtrer par date
+      if (trans.date < startDate || trans.date > endDate) return;
+      
+      transactionCount++;
+      const { type, amount, category } = trans;
+      
       if (type === 'income') {
         totalIncome += amount;
         incomesByCategory[category] = (incomesByCategory[category] || 0) + amount;
@@ -49,12 +78,10 @@ router.get('/summary', async (req, res) => {
         startDate: startDate.toISOString(),
         endDate: endDate.toISOString()
       },
-      summary: {
-        totalIncome,
-        totalExpense,
-        balance,
-        transactionCount: transactionsSnapshot.size
-      },
+      totalIncome,
+      totalExpense,
+      balance,
+      transactionCount,
       breakdown: {
         expensesByCategory,
         incomesByCategory
@@ -71,32 +98,30 @@ router.get('/trend', async (req, res) => {
   try {
     const { months = 6 } = req.query;
     const db = admin.firestore();
-
     const now = new Date();
-    const trends = [];
+
+    // Récupérer toutes les transactions une seule fois
+    const allTransactions = await getUserTransactions(db, req.user.userId);
+
+    const data = [];
 
     for (let i = parseInt(months) - 1; i >= 0; i--) {
       const startDate = new Date(now.getFullYear(), now.getMonth() - i, 1);
       const endDate = new Date(now.getFullYear(), now.getMonth() - i + 1, 0, 23, 59, 59);
 
-      const snapshot = await db.collection('transactions')
-        .where('userId', '==', req.user.userId)
-        .where('date', '>=', admin.firestore.Timestamp.fromDate(startDate))
-        .where('date', '<=', admin.firestore.Timestamp.fromDate(endDate))
-        .get();
-
       let income = 0;
       let expense = 0;
 
-      snapshot.forEach(doc => {
-        const { type, amount } = doc.data();
-        if (type === 'income') income += amount;
-        else expense += amount;
+      // Filtrer côté serveur
+      allTransactions.forEach(trans => {
+        if (trans.date < startDate || trans.date > endDate) return;
+        
+        if (trans.type === 'income') income += trans.amount;
+        else expense += trans.amount;
       });
 
-      trends.push({
-        month: startDate.toLocaleString('fr-FR', { month: 'short', year: 'numeric' }),
-        monthIndex: startDate.getMonth() + 1,
+      data.push({
+        month: startDate.getMonth() + 1,
         year: startDate.getFullYear(),
         income,
         expense,
@@ -104,7 +129,7 @@ router.get('/trend', async (req, res) => {
       });
     }
 
-    res.json({ trends });
+    res.json({ data });
   } catch (error) {
     console.error('Erreur tendances:', error);
     res.status(500).json({ error: 'Erreur lors de la récupération des tendances' });
@@ -117,21 +142,17 @@ router.get('/recent', async (req, res) => {
     const { limit = 5 } = req.query;
     const db = admin.firestore();
 
-    const snapshot = await db.collection('transactions')
-      .where('userId', '==', req.user.userId)
-      .orderBy('date', 'desc')
-      .limit(parseInt(limit))
-      .get();
+    // Récupérer toutes les transactions
+    const allTransactions = await getUserTransactions(db, req.user.userId);
 
-    const transactions = [];
-    snapshot.forEach(doc => {
-      const data = doc.data();
-      transactions.push({
-        id: doc.id,
-        ...data,
-        date: data.date.toDate().toISOString()
-      });
-    });
+    // Trier par date décroissante et limiter
+    const transactions = allTransactions
+      .sort((a, b) => b.date - a.date)
+      .slice(0, parseInt(limit))
+      .map(t => ({
+        ...t,
+        date: t.date.toISOString()
+      }));
 
     res.json({ transactions });
   } catch (error) {
@@ -148,38 +169,41 @@ router.get('/alerts', async (req, res) => {
     const month = now.getMonth() + 1;
     const year = now.getFullYear();
 
-    // Récupérer les budgets du mois
+    // Récupérer les budgets du mois (requête simple)
     const budgetsSnapshot = await db.collection('budgets')
       .where('userId', '==', req.user.userId)
-      .where('month', '==', month)
-      .where('year', '==', year)
       .get();
+    
+    // Filtrer par mois/année côté serveur
+    const budgets = [];
+    budgetsSnapshot.forEach(doc => {
+      const data = doc.data();
+      if (data.month === month && data.year === year) {
+        budgets.push({ id: doc.id, ...data });
+      }
+    });
 
-    if (budgetsSnapshot.empty) {
+    if (budgets.length === 0) {
       return res.json({ alerts: [] });
     }
 
-    // Calculer les dépenses du mois
+    // Récupérer toutes les transactions et filtrer
+    const allTransactions = await getUserTransactions(db, req.user.userId);
+    
     const startDate = new Date(year, month - 1, 1);
     const endDate = new Date(year, month, 0, 23, 59, 59);
 
-    const transactionsSnapshot = await db.collection('transactions')
-      .where('userId', '==', req.user.userId)
-      .where('type', '==', 'expense')
-      .where('date', '>=', admin.firestore.Timestamp.fromDate(startDate))
-      .where('date', '<=', admin.firestore.Timestamp.fromDate(endDate))
-      .get();
-
     const expensesByCategory = {};
-    transactionsSnapshot.forEach(doc => {
-      const { category, amount } = doc.data();
-      expensesByCategory[category] = (expensesByCategory[category] || 0) + amount;
+    allTransactions.forEach(trans => {
+      if (trans.type !== 'expense') return;
+      if (trans.date < startDate || trans.date > endDate) return;
+      
+      expensesByCategory[trans.category] = (expensesByCategory[trans.category] || 0) + trans.amount;
     });
 
     // Générer les alertes
     const alerts = [];
-    budgetsSnapshot.forEach(doc => {
-      const budget = doc.data();
+    budgets.forEach(budget => {
       const spent = expensesByCategory[budget.category] || 0;
       const percentage = (spent / budget.amount) * 100;
 
@@ -212,23 +236,19 @@ router.get('/stats', async (req, res) => {
   try {
     const db = admin.firestore();
 
-    // Total de toutes les transactions
-    const allTransactions = await db.collection('transactions')
-      .where('userId', '==', req.user.userId)
-      .get();
+    // Récupérer toutes les transactions
+    const allTransactions = await getUserTransactions(db, req.user.userId);
 
     let totalIncome = 0;
     let totalExpense = 0;
     let firstTransactionDate = null;
 
-    allTransactions.forEach(doc => {
-      const { type, amount, date } = doc.data();
-      if (type === 'income') totalIncome += amount;
-      else totalExpense += amount;
+    allTransactions.forEach(trans => {
+      if (trans.type === 'income') totalIncome += trans.amount;
+      else totalExpense += trans.amount;
 
-      const transDate = date.toDate();
-      if (!firstTransactionDate || transDate < firstTransactionDate) {
-        firstTransactionDate = transDate;
+      if (!firstTransactionDate || trans.date < firstTransactionDate) {
+        firstTransactionDate = trans.date;
       }
     });
 
@@ -249,7 +269,7 @@ router.get('/stats', async (req, res) => {
         totalIncome,
         totalExpense,
         totalSavings: totalIncome - totalExpense,
-        transactionCount: allTransactions.size,
+        transactionCount: allTransactions.length,
         monthsTracked,
         avgMonthlySavings: Math.round(avgMonthlySavings),
         savingsRate: totalIncome > 0 ? Math.round(((totalIncome - totalExpense) / totalIncome) * 100) : 0
