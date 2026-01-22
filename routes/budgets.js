@@ -2,27 +2,38 @@ const express = require('express');
 const router = express.Router();
 const admin = require('firebase-admin');
 
+// Helper: Convertir date Firestore en Date JS
+function toJsDate(firestoreDate) {
+  if (!firestoreDate) return new Date();
+  if (firestoreDate.toDate) return firestoreDate.toDate();
+  return new Date(firestoreDate);
+}
+
 // Récupérer tous les budgets de l'utilisateur
 router.get('/', async (req, res) => {
   try {
     const db = admin.firestore();
     const { month, year } = req.query;
 
-    let query = db.collection('budgets')
-      .where('userId', '==', req.user.userId);
-
-    if (month && year) {
-      query = query.where('month', '==', parseInt(month))
-                   .where('year', '==', parseInt(year));
-    }
-
-    const snapshot = await query.get();
+    // Requête simple sans filtres composites
+    const snapshot = await db.collection('budgets')
+      .where('userId', '==', req.user.userId)
+      .get();
 
     const budgets = [];
     snapshot.forEach(doc => {
+      const data = doc.data();
+      
+      // Filtrer par mois/année côté serveur si demandé
+      if (month && year) {
+        if (data.month !== parseInt(month) || data.year !== parseInt(year)) {
+          return;
+        }
+      }
+      
       budgets.push({
         id: doc.id,
-        ...doc.data()
+        ...data
       });
     });
 
@@ -44,15 +55,22 @@ router.post('/', async (req, res) => {
 
     const db = admin.firestore();
 
-    // Vérifier si un budget existe déjà pour cette catégorie/période
-    const existing = await db.collection('budgets')
+    // Vérifier si un budget existe déjà - requête simple + filtrage serveur
+    const allBudgets = await db.collection('budgets')
       .where('userId', '==', req.user.userId)
-      .where('category', '==', category)
-      .where('month', '==', parseInt(month))
-      .where('year', '==', parseInt(year))
       .get();
 
-    if (!existing.empty) {
+    let exists = false;
+    allBudgets.forEach(doc => {
+      const data = doc.data();
+      if (data.category === category && 
+          data.month === parseInt(month) && 
+          data.year === parseInt(year)) {
+        exists = true;
+      }
+    });
+
+    if (exists) {
       return res.status(400).json({ error: 'Un budget existe déjà pour cette catégorie et période' });
     }
 
@@ -158,68 +176,66 @@ router.get('/tracking', async (req, res) => {
     }
 
     const db = admin.firestore();
+    const monthInt = parseInt(month);
+    const yearInt = parseInt(year);
 
-    // Récupérer les budgets du mois
-    const budgetsSnapshot = await db.collection('budgets')
+    // Récupérer tous les budgets de l'utilisateur
+    const allBudgets = await db.collection('budgets')
       .where('userId', '==', req.user.userId)
-      .where('month', '==', parseInt(month))
-      .where('year', '==', parseInt(year))
       .get();
 
-    // Calculer les dates de début et fin du mois
-    const startDate = new Date(parseInt(year), parseInt(month) - 1, 1);
-    const endDate = new Date(parseInt(year), parseInt(month), 0, 23, 59, 59);
-
-    // Récupérer les dépenses du mois
-    const transactionsSnapshot = await db.collection('transactions')
-      .where('userId', '==', req.user.userId)
-      .where('type', '==', 'expense')
-      .where('date', '>=', admin.firestore.Timestamp.fromDate(startDate))
-      .where('date', '<=', admin.firestore.Timestamp.fromDate(endDate))
-      .get();
-
-    // Calculer les dépenses par catégorie
-    const expensesByCategory = {};
-    transactionsSnapshot.forEach(doc => {
-      const { category, amount } = doc.data();
-      expensesByCategory[category] = (expensesByCategory[category] || 0) + amount;
+    // Filtrer par mois/année côté serveur
+    const budgets = [];
+    allBudgets.forEach(doc => {
+      const data = doc.data();
+      if (data.month === monthInt && data.year === yearInt) {
+        budgets.push({ id: doc.id, ...data });
+      }
     });
 
-    // Construire le suivi
-    const tracking = [];
-    budgetsSnapshot.forEach(doc => {
-      const budget = doc.data();
+    // Calculer les dates de début et fin du mois
+    const startDate = new Date(yearInt, monthInt - 1, 1);
+    const endDate = new Date(yearInt, monthInt, 0, 23, 59, 59);
+
+    // Récupérer TOUTES les transactions de l'utilisateur (requête simple)
+    const allTransactions = await db.collection('transactions')
+      .where('userId', '==', req.user.userId)
+      .get();
+
+    // Filtrer côté serveur: type=expense et dans la période
+    const expensesByCategory = {};
+    allTransactions.forEach(doc => {
+      const data = doc.data();
+      
+      // Filtrer par type
+      if (data.type !== 'expense') return;
+      
+      // Filtrer par date
+      const transDate = toJsDate(data.date);
+      if (transDate < startDate || transDate > endDate) return;
+      
+      // Agréger par catégorie
+      expensesByCategory[data.category] = (expensesByCategory[data.category] || 0) + data.amount;
+    });
+
+    // Construire le suivi avec les dépenses calculées
+    const tracking = budgets.map(budget => {
       const spent = expensesByCategory[budget.category] || 0;
       const remaining = budget.amount - spent;
       const percentage = budget.amount > 0 ? (spent / budget.amount) * 100 : 0;
 
-      tracking.push({
-        id: doc.id,
+      return {
+        id: budget.id,
         category: budget.category,
-        budgeted: budget.amount,
+        amount: budget.amount,
         spent,
         remaining,
-        percentage: Math.round(percentage * 100) / 100,
+        percentage: Math.round(percentage),
         status: percentage > 100 ? 'exceeded' : percentage > 80 ? 'warning' : 'ok'
-      });
+      };
     });
 
-    // Ajouter les catégories sans budget
-    Object.keys(expensesByCategory).forEach(category => {
-      if (!tracking.find(t => t.category === category)) {
-        tracking.push({
-          id: null,
-          category,
-          budgeted: 0,
-          spent: expensesByCategory[category],
-          remaining: -expensesByCategory[category],
-          percentage: 100,
-          status: 'no_budget'
-        });
-      }
-    });
-
-    res.json({ tracking });
+    res.json({ budgets: tracking });
   } catch (error) {
     console.error('Erreur suivi budgets:', error);
     res.status(500).json({ error: 'Erreur lors du suivi des budgets' });

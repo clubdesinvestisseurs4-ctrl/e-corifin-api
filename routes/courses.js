@@ -51,37 +51,59 @@ router.get('/access-status', async (req, res) => {
 router.get('/chapters', checkFormationAccess, async (req, res) => {
   try {
     const db = admin.firestore();
-    const chaptersSnapshot = await db.collection('courses')
-      .orderBy('order', 'asc')
+    
+    // Récupérer tous les cours (chapitres)
+    const chaptersSnapshot = await db.collection('courses').get();
+
+    // Récupérer toutes les leçons
+    const lessonsSnapshot = await db.collection('lessons').get();
+    
+    // Récupérer la progression de l'utilisateur
+    const progressSnapshot = await db.collection('userProgress')
+      .where('userId', '==', req.user.userId)
       .get();
 
+    // Mapper les leçons par courseId
+    const lessonsByCourse = {};
+    lessonsSnapshot.forEach(doc => {
+      const data = doc.data();
+      if (!lessonsByCourse[data.courseId]) {
+        lessonsByCourse[data.courseId] = [];
+      }
+      lessonsByCourse[data.courseId].push(doc.id);
+    });
+
+    // Mapper les leçons complétées par courseId
+    const completedByCourse = {};
+    progressSnapshot.forEach(doc => {
+      const data = doc.data();
+      if (!completedByCourse[data.courseId]) {
+        completedByCourse[data.courseId] = 0;
+      }
+      completedByCourse[data.courseId]++;
+    });
+
+    // Construire la liste des chapitres
     const chapters = [];
-    for (const doc of chaptersSnapshot.docs) {
+    chaptersSnapshot.forEach(doc => {
       const chapterData = doc.data();
-      
-      // Récupérer le nombre de leçons pour chaque chapitre
-      const lessonsCount = await db.collection('lessons')
-        .where('courseId', '==', doc.id)
-        .get();
-
-      // Récupérer la progression de l'utilisateur pour ce chapitre
-      const progressSnapshot = await db.collection('userProgress')
-        .where('userId', '==', req.user.userId)
-        .where('courseId', '==', doc.id)
-        .get();
-
-      const completedLessons = progressSnapshot.size;
+      const lessonsCount = lessonsByCourse[doc.id] ? lessonsByCourse[doc.id].length : 0;
+      const completedLessons = completedByCourse[doc.id] || 0;
 
       chapters.push({
         id: doc.id,
         title: chapterData.title,
         description: chapterData.description,
-        order: chapterData.order,
-        lessonsCount: lessonsCount.size,
-        completedLessons,
-        progress: lessonsCount.size > 0 ? Math.round((completedLessons / lessonsCount.size) * 100) : 0
+        order: chapterData.order || 0,
+        progress: {
+          total: lessonsCount,
+          completed: completedLessons
+        }
       });
-    }
+    });
+
+    // Trier par order côté serveur
+    chapters.sort((a, b) => a.order - b.order);
 
     res.json({ chapters });
   } catch (error) {
@@ -94,7 +116,6 @@ router.get('/chapters', checkFormationAccess, async (req, res) => {
 router.get('/chapters/:chapterId/lessons', checkFormationAccess, async (req, res) => {
   try {
     const { chapterId } = req.params;
-
     const db = admin.firestore();
 
     // Vérifier que le chapitre existe
@@ -103,34 +124,44 @@ router.get('/chapters/:chapterId/lessons', checkFormationAccess, async (req, res
       return res.status(404).json({ error: 'Chapitre non trouvé' });
     }
 
-    // Récupérer les leçons
-    const lessonsSnapshot = await db.collection('lessons')
-      .where('courseId', '==', chapterId)
-      .orderBy('order', 'asc')
-      .get();
+    // Récupérer TOUTES les leçons (requête simple)
+    const lessonsSnapshot = await db.collection('lessons').get();
 
-    // Récupérer la progression de l'utilisateur
-    const progressSnapshot = await db.collection('userProgress')
-      .where('userId', '==', req.user.userId)
-      .where('courseId', '==', chapterId)
-      .get();
-
-    const completedLessonIds = new Set();
-    progressSnapshot.forEach(doc => {
-      completedLessonIds.add(doc.data().lessonId);
-    });
-
+    // Filtrer par courseId côté serveur
     const lessons = [];
     lessonsSnapshot.forEach(doc => {
-      const lessonData = doc.data();
-      lessons.push({
-        id: doc.id,
-        title: lessonData.title,
-        description: lessonData.description,
-        order: lessonData.order,
-        duration: lessonData.duration,
-        completed: completedLessonIds.has(doc.id)
-      });
+      const data = doc.data();
+      if (data.courseId === chapterId) {
+        lessons.push({
+          id: doc.id,
+          title: data.title,
+          description: data.description,
+          order: data.order || 0,
+          duration: data.duration,
+          completed: false // sera mis à jour après
+        });
+      }
+    });
+
+    // Trier par order côté serveur
+    lessons.sort((a, b) => a.order - b.order);
+
+    // Récupérer la progression de l'utilisateur pour ce chapitre
+    const progressSnapshot = await db.collection('userProgress')
+      .where('userId', '==', req.user.userId)
+      .get();
+
+    // Marquer les leçons complétées
+    const completedLessonIds = new Set();
+    progressSnapshot.forEach(doc => {
+      const data = doc.data();
+      if (data.courseId === chapterId) {
+        completedLessonIds.add(data.lessonId);
+      }
+    });
+
+    lessons.forEach(lesson => {
+      lesson.completed = completedLessonIds.has(lesson.id);
     });
 
     res.json({
@@ -151,8 +182,8 @@ router.get('/chapters/:chapterId/lessons', checkFormationAccess, async (req, res
 router.get('/lessons/:lessonId', checkFormationAccess, async (req, res) => {
   try {
     const { lessonId } = req.params;
-
     const db = admin.firestore();
+    
     const lessonDoc = await db.collection('lessons').doc(lessonId).get();
 
     if (!lessonDoc.exists) {
@@ -164,34 +195,37 @@ router.get('/lessons/:lessonId', checkFormationAccess, async (req, res) => {
     // Vérifier si la leçon est complétée
     const progressSnapshot = await db.collection('userProgress')
       .where('userId', '==', req.user.userId)
-      .where('lessonId', '==', lessonId)
       .get();
 
-    // Récupérer les leçons précédente et suivante
-    const allLessons = await db.collection('lessons')
-      .where('courseId', '==', lessonData.courseId)
-      .orderBy('order', 'asc')
-      .get();
-
-    let prevLesson = null;
-    let nextLesson = null;
-    let currentIndex = -1;
-
-    allLessons.forEach((doc, index) => {
-      if (doc.id === lessonId) {
-        currentIndex = index;
+    let isCompleted = false;
+    progressSnapshot.forEach(doc => {
+      if (doc.data().lessonId === lessonId) {
+        isCompleted = true;
       }
     });
 
-    if (currentIndex > 0) {
-      const prevDoc = allLessons.docs[currentIndex - 1];
-      prevLesson = { id: prevDoc.id, title: prevDoc.data().title };
-    }
+    // Récupérer toutes les leçons du même chapitre pour la navigation
+    const allLessonsSnapshot = await db.collection('lessons').get();
+    
+    const courseLessons = [];
+    allLessonsSnapshot.forEach(doc => {
+      const data = doc.data();
+      if (data.courseId === lessonData.courseId) {
+        courseLessons.push({
+          id: doc.id,
+          order: data.order || 0,
+          title: data.title
+        });
+      }
+    });
 
-    if (currentIndex < allLessons.size - 1) {
-      const nextDoc = allLessons.docs[currentIndex + 1];
-      nextLesson = { id: nextDoc.id, title: nextDoc.data().title };
-    }
+    // Trier par order
+    courseLessons.sort((a, b) => a.order - b.order);
+
+    // Trouver la position actuelle
+    let currentIndex = courseLessons.findIndex(l => l.id === lessonId);
+    let prevLesson = currentIndex > 0 ? courseLessons[currentIndex - 1] : null;
+    let nextLesson = currentIndex < courseLessons.length - 1 ? courseLessons[currentIndex + 1] : null;
 
     res.json({
       lesson: {
@@ -202,7 +236,7 @@ router.get('/lessons/:lessonId', checkFormationAccess, async (req, res) => {
         videoUrl: lessonData.videoUrl,
         duration: lessonData.duration,
         order: lessonData.order,
-        completed: !progressSnapshot.empty
+        completed: isCompleted
       },
       navigation: {
         previous: prevLesson,
@@ -219,7 +253,6 @@ router.get('/lessons/:lessonId', checkFormationAccess, async (req, res) => {
 router.post('/lessons/:lessonId/complete', checkFormationAccess, async (req, res) => {
   try {
     const { lessonId } = req.params;
-
     const db = admin.firestore();
 
     // Vérifier que la leçon existe
@@ -231,10 +264,16 @@ router.post('/lessons/:lessonId/complete', checkFormationAccess, async (req, res
     // Vérifier si déjà complété
     const existingProgress = await db.collection('userProgress')
       .where('userId', '==', req.user.userId)
-      .where('lessonId', '==', lessonId)
       .get();
 
-    if (!existingProgress.empty) {
+    let alreadyCompleted = false;
+    existingProgress.forEach(doc => {
+      if (doc.data().lessonId === lessonId) {
+        alreadyCompleted = true;
+      }
+    });
+
+    if (alreadyCompleted) {
       return res.json({ message: 'Leçon déjà marquée comme complétée' });
     }
 
@@ -266,13 +305,13 @@ router.get('/progress', checkFormationAccess, async (req, res) => {
       .where('userId', '==', req.user.userId)
       .get();
 
-    const progress = totalLessons.size > 0 
-      ? Math.round((completedLessons.size / totalLessons.size) * 100) 
-      : 0;
+    const total = totalLessons.size;
+    const completed = completedLessons.size;
+    const progress = total > 0 ? Math.round((completed / total) * 100) : 0;
 
     res.json({
-      totalLessons: totalLessons.size,
-      completedLessons: completedLessons.size,
+      totalLessons: total,
+      completedLessons: completed,
       progress
     });
   } catch (error) {
