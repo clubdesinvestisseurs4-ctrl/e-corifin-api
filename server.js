@@ -22,9 +22,12 @@ const app = express();
 
 // Middlewares de sécurité
 app.use(helmet());
+const frontendUrl = (process.env.FRONTEND_URL || '').replace(/\/$/, '');
 app.use(cors({
-  origin: process.env.FRONTEND_URL || '*',
-  credentials: true
+  origin: frontendUrl || '*',
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
 }));
 app.use(express.json());
 
