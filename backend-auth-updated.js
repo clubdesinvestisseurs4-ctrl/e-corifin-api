@@ -10,7 +10,7 @@ const JWT_EXPIRES_IN = '7d';
 // Inscription
 router.post('/register', async (req, res) => {
   try {
-    const { email, password, fullName, purchaseCode } = req.body;
+    const { email, password, fullName } = req.body;
 
     if (!email || !password || !fullName) {
       return res.status(400).json({ error: 'Email, mot de passe et nom complet requis' });
@@ -21,48 +21,11 @@ router.post('/register', async (req, res) => {
     }
 
     const db = admin.firestore();
-    const normalizedEmail = email.toLowerCase().trim();
     
     // Vérifier si l'utilisateur existe déjà
-    const existingUser = await db.collection('users').where('email', '==', normalizedEmail).get();
+    const existingUser = await db.collection('users').where('email', '==', email.toLowerCase()).get();
     if (!existingUser.empty) {
       return res.status(400).json({ error: 'Un compte existe déjà avec cet email' });
-    }
-
-    // Vérifier le code d'achat si fourni
-    let hasFormationAccess = false;
-    let purchaseDoc = null;
-    
-    if (purchaseCode) {
-      const cleanCode = purchaseCode.trim().toUpperCase();
-      const purchaseQuery = await db.collection('purchases')
-        .where('code', '==', cleanCode)
-        .where('used', '==', false)
-        .get();
-      
-      if (!purchaseQuery.empty) {
-        purchaseDoc = purchaseQuery.docs[0];
-        const purchaseData = purchaseDoc.data();
-        
-        // Vérifier que l'email correspond
-        if (purchaseData.email && purchaseData.email.toLowerCase() !== normalizedEmail) {
-          return res.status(400).json({ 
-            error: 'Ce code est associé à un autre email. Utilisez l\'email: ' + purchaseData.email 
-          });
-        }
-        
-        // Vérifier si le code n'est pas expiré
-        if (purchaseData.expiresAt) {
-          const expiresAt = purchaseData.expiresAt.toDate ? purchaseData.expiresAt.toDate() : new Date(purchaseData.expiresAt);
-          if (new Date() > expiresAt) {
-            return res.status(400).json({ error: 'Ce code a expiré. Veuillez contacter le support.' });
-          }
-        }
-        
-        hasFormationAccess = true;
-      } else {
-        return res.status(400).json({ error: 'Code d\'achat invalide ou déjà utilisé' });
-      }
     }
 
     // Hasher le mot de passe
@@ -70,39 +33,29 @@ router.post('/register', async (req, res) => {
 
     // Créer l'utilisateur
     const userRef = await db.collection('users').add({
-      email: normalizedEmail,
+      email: email.toLowerCase(),
       password: hashedPassword,
       fullName,
-      hasFormationAccess,
-      formationActivatedAt: hasFormationAccess ? admin.firestore.FieldValue.serverTimestamp() : null,
+      hasFormationAccess: false,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    // Marquer le code comme utilisé si validé
-    if (purchaseDoc) {
-      await purchaseDoc.ref.update({ 
-        used: true, 
-        usedAt: admin.firestore.FieldValue.serverTimestamp(),
-        usedBy: userRef.id
-      });
-    }
-
     // Générer le token
     const token = jwt.sign(
-      { userId: userRef.id, email: normalizedEmail },
+      { userId: userRef.id, email: email.toLowerCase() },
       JWT_SECRET,
       { expiresIn: JWT_EXPIRES_IN }
     );
 
     res.status(201).json({
-      message: hasFormationAccess ? 'Compte créé avec accès formation !' : 'Compte créé avec succès',
+      message: 'Compte créé avec succès',
       token,
       user: {
         id: userRef.id,
-        email: normalizedEmail,
+        email: email.toLowerCase(),
         fullName,
-        hasFormationAccess
+        hasFormationAccess: false
       }
     });
   } catch (error) {
